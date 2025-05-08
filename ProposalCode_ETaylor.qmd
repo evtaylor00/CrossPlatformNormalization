@@ -1,0 +1,572 @@
+---
+title: "STAT 6358 Project Proposal Code"
+author: "Ellen Taylor"
+format: html
+editor: visual
+---
+
+## Loading Necessary Libraries
+
+```{r}
+library(MASS)
+library(Matrix)
+library(gdata)
+library(pROC)
+library(randomForest)
+library(limma)
+library(discretization)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("preprocessCore")
+library(preprocessCore)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+## RNA-Seq and Microarray Simulation Function
+
+```{r}
+
+genRNASeq<- function(m = 100, n=200, mu, sig, corr_mat, corr_mat_2, fc, vf,skew){
+
+  if (any(sig <= 0) | sum(sig<mu)!=0) {
+    stop("Variance (sig) must be positive for all genes and variance must be greater than mean")
+  }
+  
+  if(length(fc)!=m){
+    stop("The fold change (fc) must be a vector of length m")
+  }
+
+  if(length(mu)!=m){
+    stop("The mean (mu) for gene counts must be a vector of length m")
+  }
+
+  if(length(sig)!=m){
+    stop("The variance (sig) for gene counts must be a vector of length m")
+  }
+
+  if(nrow(corr_mat)!=m|ncol(corr_mat)!=m){
+    stop("The correlation matrix (corr_mat) must be a matrix of dimensions mxm")
+  }
+
+  ### generating control data ###
+  # Make it positive definite using nearPD
+  library(gdata)
+  sigma_pd <- as.matrix(nearPD(corr_mat, corr = TRUE)$mat)
+
+  # Extract a valid correlation matrix for the copula
+  copula_corr <- cov2cor(sigma_pd)  # Ensure valid correlation
+  diag(copula_corr) <- 1  # Reinforce diagonal as 1
+
+  # Generate multivariate normal samples
+  z <- mvrnorm(n, mu = rep(0, m), Sigma = copula_corr, empirical = TRUE)
+  u <- pnorm(z)  # Convert normal samples to uniform
+
+  # Define Beta parameters
+  alpha <- (mu/100)*(((mu*(100-mu))/(sig-mu))-1)
+  beta <- alpha * (100 - mu) / mu
+ 
+  # Generate correlated Beta-distributed values
+  rand.beta_group1 <- sapply(1:m, function(i) qbeta(u[, i], alpha[i], beta[i]))
+
+  # Define and Sample from Gaussian Copula
+  z <- mvrnorm(n, mu = rep(0, m), Sigma = copula_corr, empirical = TRUE)
+  u <- pnorm(z)  # Convert normal samples to uniform
+   
+  # Transform Copula Samples into Poisson-Distributed Values
+  rand.pois_group1 <- sapply(1:m, function(i) qpois(u[, i], lambda = 100 * 
+                                                      rand.beta_group1[, i]))
+  
+  # Check correlations
+  var(rand.pois_group1[,1])
+  cor_poisson <- cor(rand.pois_group1[,4], rand.pois_group1[,2],method="spearman")
+  cor_beta <- cor(rand.beta_group1[,4], rand.beta_group1[,2],method="spearman")
+  cat("Correlation between Beta variables:", cor_beta, "\n")
+  cat("Correlation between Poisson variables:", cor_poisson, "\n")
+  
+  ### generating treatment data ###
+  # Make it positive definite using nearPD
+  library(gdata)
+  sigma_pd_2 <- as.matrix(nearPD(corr_mat_2, corr = TRUE)$mat)
+  
+  # Extract a valid correlation matrix for the copula
+  copula_corr_2 <- cov2cor(sigma_pd_2)  # Ensure valid correlation
+  diag(copula_corr_2) <- 1  # Reinforce diagonal as 1
+  
+  # Adjust mean and variance using a scaling factor
+  mu_treated <- mu * fc  # Increase mean by fold change
+  sig_treated <- sig * vf  # Adjust variance separately
+
+  # Recalculate alpha and beta
+  alpha_treated <- (mu_treated/100)*(((mu_treated*(100-mu_treated))/
+                                        (sig_treated-mu_treated))-1)
+  beta_treated <- alpha_treated * ((100 - mu_treated) / mu_treated)
+  
+  # Generate multivariate normal samples
+  z <- mvrnorm(n, mu = rep(0, m), Sigma = copula_corr_2, empirical = TRUE)
+  u <- pnorm(z)  # Convert normal samples to uniform
+  
+  # Generate correlated Beta-distributed values
+  rand.beta_group2 <- sapply(1:m, function(i) qbeta(u[, i], alpha_treated[i], 
+                                                    beta_treated[i]))
+  # Generate multivariate normal samples
+  z <- mvrnorm(n, mu = rep(0, m), Sigma = copula_corr_2, empirical = TRUE)
+  u <- pnorm(z)  # Convert normal samples to uniform
+  
+  # Transform Copula Samples into Poisson-Distributed Values
+  rand.pois_group2 <- sapply(1:m, function(i) qpois(u[, i], lambda = 100 * 
+                                                      rand.beta_group2[, i]))
+
+  # correlation check to ensure correlation is correctly preserved
+  cor_poisson <- cor(rand.pois_group2[,1], rand.pois_group2[,2])
+  cor_beta <- cor(rand.beta_group2[,1], rand.beta_group2[,2])
+  cat("Correlation between Beta variables:", cor_beta, "\n")
+  cat("Correlation between Poisson variables:", cor_poisson, "\n")
+  
+  ### creating microarray data ###
+  rna_seq_log_1 <- log2(rand.pois_group1 + 1)
+  rna_seq_log_2 <- log2(rand.pois_group2 + 1)
+  
+  # Introduce nonlinear bias using a sigmoid-like transformation
+  nonlinear_bias <- function(x) {
+    return (10 / (1 + exp(-0.8 * (x - 6))))  # Sigmoid compression at high values
+  }
+  
+  microarray_nonlinear_1 <- sapply(1:m, function(i) sapply(1:n, function(j) 
+    nonlinear_bias(rna_seq_log_1[j,i])))
+  microarray_nonlinear_2 <- sapply(1:m, function(i) sapply(1:n, function(j) 
+    nonlinear_bias(rna_seq_log_2[j,i])))
+  
+  # Introduce quadratic bias
+  microarray_nonlinear_1 <- (microarray_nonlinear_1 + 0.05 * (rna_seq_log_1^(1/2)))/2
+  microarray_nonlinear_2 <- (microarray_nonlinear_2 + 0.05 * (rna_seq_log_2^(1/2)))/2
+  
+  # Add Gaussian noise to simulate microarray measurement variation
+  micro_rand.pois_group1<- sapply(1:m, function(i) sapply(1:n, function(j) 
+    microarray_nonlinear_1[j,i]+rnorm(1,0,0.5))) #add noise (0.5)
+  micro_rand.pois_group2<- sapply(1:m, function(i) sapply(1:n, function(j) 
+    microarray_nonlinear_2[j,i]+rnorm(1,0,0.5))) #add noise (0.5)
+  
+  #return microarray and rna-seq data for both control and treatment groups
+  return(list(round(rand.pois_group1), round(rand.pois_group2), 
+              micro_rand.pois_group1, micro_rand.pois_group2))
+}
+```
+
+## Setting Initial Values for Simulation
+
+```{r}
+set.seed(100)
+m <- 500 # number of genes
+n <- 500 # number of samples
+mu<-c(rep(4,m/10), rep(6,m/10),rep(8,m/10),rep(7,m/10), rep(6,m/10), rep(12,m/10), 
+      rep(20,m/10), rep(5,m/10), rep(2,m/10),rep(4,m/10)) # mean gene expression
+sig<-c(sample(40:100,500,replace=TRUE)) # mean variance
+
+# Creating a random correlation matrix
+correlations <- runif(125000, -1, 1) + 0.3
+correlations[correlations > 1] <- 1
+corr_mat <- matrix(NA,nrow=m,ncol=m)
+upperTriangle(corr_mat)<-correlations
+lowerTriangle(corr_mat,byrow=TRUE)<-correlations
+diag(corr_mat)<-rep(1,m)
+
+fc<-c(sample(c(rep(1.3, 50),rep(1,450)))) # specify fold change
+vf<-c(sample(c(rep(1.2, 25),rep(1,475)))) # specify variance change
+```
+
+## Generate Data and View Distributions
+
+Note that samples are rows and genes are columns (opposite normal). This made it easier for random forest classification.
+
+```{r}
+test<-genRNASeq(m,n,mu,sig,corr_mat, corr_mat, fc,vf,"right")
+
+# separate into control and treatment groups
+rnaseq_control<-as.data.frame(cbind(log2(test[[1]]+1), rep(0,500)))
+rnaseq_treatment<-as.data.frame(cbind(log2(test[[2]]+1), rep(1,500)))
+microarray_control<-as.data.frame(cbind(test[[3]], rep(0,500)))
+microarray_treatment<-as.data.frame(cbind(test[[4]], rep(1,500)))
+rnaseq_sample<-rbind(rnaseq_control,rnaseq_treatment)
+microarray_sample<-rbind(microarray_control,microarray_treatment)
+
+# label columns
+colnames(rnaseq_sample)<-c(paste0("gene_", 1:500), "Group")
+colnames(microarray_sample)<-c(paste0("gene_", 1:500), "Group")
+
+# ensure "group" is factor variable
+microarray_sample$Group<-as.factor(microarray_sample$Group)
+rnaseq_sample$Group<-as.factor(rnaseq_sample$Group)
+
+# plots
+plot(density(microarray_sample[,15]),main="Microarray Distribution")
+plot(density(rnaseq_sample[,15]),main="RNA-Seq Distribution")
+plot(microarray_sample[,15], rnaseq_sample[,15],pch=18,col="dodgerblue4", ylab="RNA-Seq", xlab="Microarray")
+
+cor(microarray_sample[,15], rnaseq_sample[,15],method="spearman")
+
+```
+
+## Results
+
+### No Discretization
+
+```{r}
+
+#non-discretized data
+set.seed(200)
+index<-sample(1:1000,200)
+rnaseq_train<-rnaseq_sample[-index,]
+rnaseq_test<-rnaseq_sample[index,]
+
+set.seed(200)
+index<-sample(1:1000,200)
+mc_train<-microarray_sample[-index,]
+mc_test<-microarray_sample[index,]
+
+# Train and tune the RF model
+t <- tuneRF(
+  x = rnaseq_train[, -501],  # All predictor variables (excluding 5th column)
+  y = rnaseq_train[, 501],   # Response variable (5th column)
+  stepFactor = 0.7, # Shrinks `mtry` in steps of 50% for finer tuning
+  plot = TRUE,      # Plots the error vs `mtry`
+  ntreeTry = 500,   # Number of trees to use while tuning
+  trace = TRUE,     # Prints progress
+  improve = 0.01    # Minimum improvement required to update `mtry`
+)
+best_mtry <- t[which.min(t[, 2]), 1]  # Selects best `mtry`
+rf_model <- randomForest(Group ~ ., data = rnaseq_train, mtry = best_mtry)
+
+# Make predictions on the test data
+# change "rnaseq_test" to "mc_test" for microarray auc
+test.predictions <- predict(rf_model, newdata = rnaseq_test, type="response")
+
+# Create the ROC curve and calculate AUC on test data
+roc.test <- roc(rnaseq_test$Group, as.numeric(test.predictions))
+auc(roc.test)
+```
+
+### Equal Frequency Discretization
+
+Changing `"equalfreq"` below to `"equalwidth"` and re-running the code generates the equal width discretization results.
+
+```{r}
+
+rnaseq_disc<-rnaseq_sample
+mc_disc<-microarray_sample
+
+rnaseq_disc[,1:500]<-data.frame(sapply(1:500, function(i) 
+  infotheo::discretize(rnaseq_sample[,i],"equalfreq",8)))
+mc_disc[,1:500]<-data.frame(sapply(1:500, function(i) 
+  infotheo::discretize(microarray_sample[,i],"equalfreq",8))) 
+
+
+set.seed(200)
+index<-sample(1:1000,200)
+rnaseq_train<-rnaseq_disc[-index,]
+rnaseq_test<-rnaseq_disc[index,]
+
+set.seed(200)
+index<-sample(1:1000,200)
+mc_train<-mc_disc[-index,]
+mc_test<-mc_disc[index,]
+
+# Train and tune the RF model
+t <- tuneRF(
+  x = rnaseq_train[, -501],  # All predictor variables (excluding 5th column)
+  y = rnaseq_train[, 501],   # Response variable (5th column)
+  stepFactor = 0.7, # Shrinks `mtry` in steps of 50% for finer tuning
+  plot = TRUE,      # Plots the error vs `mtry`
+  ntreeTry = 500,   # Number of trees to use while tuning
+  trace = TRUE,     # Prints progress
+  improve = 0.01    # Minimum improvement required to update `mtry`
+)
+best_mtry <- t[which.min(t[, 2]), 1]  # Selects best `mtry`
+rf_model_1 <- randomForest(Group ~ ., data = rnaseq_train, mtry = best_mtry)
+order(importance(rf_model_1),decreasing=T)[1:10]
+
+# change "rnaseq_test" to "mc_test" for microarray auc
+# Make predictions on the test data
+test.predictions <- predict(rf_model_1, newdata = rnaseq_test, type="response")
+
+# Create the ROC curve and calculate AUC on test data
+roc.test <- roc(rnaseq_test$Group, as.numeric(test.predictions))
+auc(roc.test)
+```
+
+### Preprocesscore Normalization
+
+```{r}
+# from preprocesscore package
+rnaseq_control<-as.data.frame(cbind(log2(test[[1]]+1), rep(0,500)))
+rnaseq_treatment<-as.data.frame(cbind(log2(test[[2]]+1), rep(1,500)))
+microarray_control<-as.data.frame(cbind(test[[3]], rep(0,500)))
+microarray_treatment<-as.data.frame(cbind(test[[4]], rep(1,500)))
+rnaseq_sample<-rbind(rnaseq_control,rnaseq_treatment)
+microarray_sample<-rbind(microarray_control,microarray_treatment)
+
+# Combine RNA-seq and microarray data
+combined_sample <- rbind(rnaseq_sample[,1:500], microarray_sample[,1:500])
+
+# Apply Quantile Normalization
+# Transpose so that genes are rows and samples are columns
+normalized_sample <- normalize.quantiles(t(combined_sample))
+
+# Transpose back to match original structure (samples as rows, genes as columns)
+normalized_sample<-t(normalized_sample)
+
+# Preserve row and column names
+rownames(normalized_sample) <- rownames(combined_sample)
+
+# add treatment group column back to data
+rnaseq_sample<-cbind(normalized_sample[1:1000,],rnaseq_sample[,501])
+microarray_sample<-cbind(normalized_sample[1001:2000,],microarray_sample[,501])
+
+# add column names
+colnames(rnaseq_sample)<-c(paste0("gene_", 1:500), "Group")
+colnames(microarray_sample)<-c(paste0("gene_", 1:500), "Group")
+
+# make as data frame
+rnaseq_sample<-as.data.frame(rnaseq_sample)
+microarray_sample<-as.data.frame(microarray_sample)
+rnaseq_sample$Group<-as.factor(rnaseq_sample$Group)
+microarray_sample$Group<-as.factor(microarray_sample$Group)
+
+set.seed(200)
+index<-sample(1:1000,200)
+rnaseq_train<-rnaseq_sample[-index,]
+rnaseq_test<-rnaseq_sample[index,]
+
+set.seed(200)
+index<-sample(1:1000,200)
+mc_train<-microarray_sample[-index,]
+mc_test<-microarray_sample[index,]
+
+
+# Train and tune the RF model
+t <- tuneRF(
+  x = rnaseq_train[, -501],  # All predictor variables (excluding 5th column)
+  y = rnaseq_train[, 501],   # Response variable (5th column)
+  stepFactor = 0.7, # Shrinks `mtry` in steps of 50% for finer tuning
+  plot = TRUE,      # Plots the error vs `mtry`
+  ntreeTry = 500,   # Number of trees to use while tuning
+  trace = TRUE,     # Prints progress
+  improve = 0.01    # Minimum improvement required to update `mtry`
+)
+best_mtry <- t[which.min(t[, 2]), 1]  # Selects best `mtry`
+rf_model <- randomForest(Group ~ ., data = rnaseq_train, mtry = best_mtry)
+order(importance(rf_model),decreasing=T)[1:10]
+
+# Make predictions on the test data
+# change "rnaseq_test" to "mc_test" for microarray auc
+test.predictions <- predict(rf_model, newdata = rnaseq_test, type="response")
+
+# Create the ROC curve and calculate AUC on test data
+roc.test <- roc(rnaseq_test[,501], as.numeric(test.predictions))
+auc(roc.test)
+
+```
+
+### Feature Specific Quantile Normalization
+
+```{r}
+#https://github.com/jenniferfranks/FSQN/tree/master/R
+#FSQN function
+quantileNormalizeByFeature <- function(matrix_to_normalize,
+                                       target_distribution_matrix){
+  
+  if (ncol(matrix_to_normalize) != ncol(target_distribution_matrix)){
+    cat("ERROR: Data matrices are not compatible - column lengths differ!")
+  }
+  else{
+    
+    data.qn <- matrix(0, nrow = nrow(matrix_to_normalize),
+                      ncol = ncol(matrix_to_normalize))
+    
+    for (i in 1:ncol(matrix_to_normalize)){
+      feature.to.normalize <- matrix_to_normalize[,i]
+      target.feature.dist <- target_distribution_matrix[,i]
+      result <- normalize.quantiles.use.target(
+        x = as.matrix(feature.to.normalize),
+        target = target.feature.dist,
+        copy = TRUE)
+      data.qn[,i] <- result
+    }
+    rownames(data.qn) = rownames(matrix_to_normalize)
+    colnames(data.qn) = colnames(matrix_to_normalize)
+    return(data.qn)
+  }
+}
+
+
+rnaseq_control<-as.data.frame(cbind(log2(test[[1]]+1), rep(0,500)))
+rnaseq_treatment<-as.data.frame(cbind(log2(test[[2]]+1), rep(1,500)))
+microarray_control<-as.data.frame(cbind(test[[3]], rep(0,500)))
+microarray_treatment<-as.data.frame(cbind(test[[4]], rep(1,500)))
+rnaseq_sample<-rbind(rnaseq_control,rnaseq_treatment)
+microarray_sample<-rbind(microarray_control,microarray_treatment)
+
+# normalize microarray data to rnaseq data
+microarray_sample<-quantileNormalizeByFeature(microarray_sample,rnaseq_sample)
+microarray_sample<-as.data.frame(microarray_sample)
+
+# add column names
+colnames(rnaseq_sample)<-c(paste0("gene_", 1:500), "Group")
+colnames(microarray_sample)<-c(paste0("gene_", 1:500), "Group")
+
+# make sure group is factor variable
+microarray_sample$Group<-as.factor(microarray_sample$Group)
+rnaseq_sample$Group<-as.factor(rnaseq_sample$Group)
+
+set.seed(200)
+index<-sample(1:1000,200)
+rnaseq_train<-rnaseq_sample[-index,]
+rnaseq_test<-rnaseq_sample[index,]
+
+set.seed(200)
+index<-sample(1:1000,200)
+#index_2<-match(index,index_1)[is.na(match(index,index_1))==FALSE]
+mc_train<-microarray_sample[-index,]
+mc_test<-microarray_sample[index,]
+
+
+# Train and tune the RF model
+t <- tuneRF(
+  x = rnaseq_train[, -501],  # All predictor variables (excluding 5th column)
+  y = rnaseq_train[, 501],   # Response variable (5th column)
+  stepFactor = 0.7, # Shrinks `mtry` in steps of 50% for finer tuning
+  plot = TRUE,      # Plots the error vs `mtry`
+  ntreeTry = 500,   # Number of trees to use while tuning
+  trace = TRUE,     # Prints progress
+  improve = 0.01    # Minimum improvement required to update `mtry`
+)
+best_mtry <- t[which.min(t[, 2]), 1]  # Selects best `mtry`
+rf_model_2 <- randomForest(Group ~ ., data = rnaseq_train, mtry = best_mtry)
+
+# Make predictions on the test data
+# change "rnaseq_test" to "mc_test" for microarray auc
+test.predictions <- predict(rf_model, newdata = rnaseq_test, type="response")
+
+# Create the ROC curve and calculate AUC on test data
+roc.test <- roc(rnaseq_test[,501], as.numeric(test.predictions))
+auc(roc.test)
+```
+
+### Plotting
+```{r}
+# plotting mean decrease in gini impurity (ordered by discretized model)
+plot(importance(rf_model_1)[order(importance(rf_model_1),decreasing=T),]-
+       importance(rf_model_2)[order(importance(rf_model_1),decreasing=T),],
+     pch=20, ylab="Change in Mean Reduction in Gini Impurity", xlab="Importance Ranking")
+
+mean_decrease<-sapply(2:500, function(i) 
+                     return(
+                      mean(
+                       head(
+                         importance(
+                           rf_model_1
+                           )[order(
+                             importance(rf_model_1),decreasing=T
+                             ),]-
+                           importance(
+                             rf_model_2
+                             )[order(
+                               importance(rf_model_1),decreasing=T),],
+                         i))))
+plot(mean_decrease, pch=19, ylab="Cumulative Difference in Mean Decrease", xlab="Importance Ranking")
+
+```
+
+```{r}
+# Create results dataframe
+results <- data.frame(
+  Method = rep(c("Log2", "Equal Width", "Equal Frequency", "Quantile Normalization", "FSQN"), 4),
+  RNA_AUC = c(0.851, 0.859, 0.861, 0.873, 0.851, 0.851, 0.859, 0.861, 0.848, 0.851,
+              0.851, 0.859, 0.861, 0.913, 0.851, 0.851, 0.859, 0.861, 0.892, 0.851),
+  Mic_AUC = c(0.481, 0.500, 0.663, 0.532, 0.643, 0.483, 0.514, 0.723, 0.660, 0.730,
+              0.496, 0.529, 0.831, 0.789, 0.818, 0.489, 0.572, 0.871, 0.871, 0.846),
+  Error = rep(c(1, 0.5, 0.25, 0.1), each = 5)
+)
+
+results$Diff <- abs(results$RNA_AUC-results$Mic_AUC)
+results$Avg <- (results$RNA_AUC+results$Mic_AUC)/2
+
+# Plot
+ggplot(results, aes(x = Error, y = RNA_AUC, color = Method, group = Method)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_reverse() +
+  labs(title = "RNA-Seq Classification by Normalization Method",
+       x = "Error Level",
+       y = "AUC",
+       color = "Data Type") +
+  theme_minimal(base_size = 14)
+  
+
+ggplot(results, aes(x = Error, y = Mic_AUC, color = Method, group = Method)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_reverse() +
+  labs(title = "Microarray Classification by Normalization Method",
+       x = "Error Level",
+       y = "AUC",
+       color = "Data Type") +
+  theme_minimal(base_size = 14)
+
+ggplot(results, aes(x = Error, y = Avg, color = Method, group = Method)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_reverse() +
+  labs(title ="Average Cross-Platform Performance by Normalization Method",
+       x = "Error Level",
+       y = "AUC",
+       color = "Data Type") +
+  theme_minimal(base_size = 14)
+
+
+# Create data
+results_2 <- data.frame(
+  Method = rep(c("Log2", "Equal Width", "Equal Frequency", "Quantile Normalization", "FSQN"), 4),
+  RNA_AUC = c(0.769, 0.776, 0.765, 0.809, 0.750, 0.769, 0.776, 0.765, 0.792, 0.750,
+              0.769, 0.776, 0.765, 0.792, 0.750, 0.769, 0.776, 0.765, 0.797, 0.750),
+  Mic_AUC = c(0.500, 0.573, 0.613, 0.539, 0.592, 0.5, 0.620, 0.636, 0.593, 0.642, 
+              0.500, 0.640, 0.682, 0.676, 0.711, 0.5, 0.570, 0.747, 0.683, 0.731),
+  Error = rep(c(1, 0.5, 0.25, 0.1), each = 5)
+)
+
+results_2$Diff <- abs(results_2$RNA_AUC-results_2$Mic_AUC)
+results_2$Avg <- (results_2$RNA_AUC+results_2$Mic_AUC)/2
+
+# Plot
+ggplot(results_2, aes(x = Error, y = RNA_AUC, color = Method, group = Method)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_reverse() +
+  labs(title = "RNA-Seq Classification by Normalization Method",
+       x = "Error Level",
+       y = "AUC",
+       color = "Data Type") +
+  theme_minimal(base_size = 14)
+
+
+ggplot(results_2, aes(x = Error, y = Mic_AUC, color = Method, group = Method)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_reverse() +
+  labs(title = "Microarray Classification by Normalization Method",
+       x = "Error Level",
+       y = "AUC",
+       color = "Data Type") +
+  theme_minimal(base_size = 14)
+
+ggplot(results_2, aes(x = Error, y = Avg, color = Method, group = Method)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_reverse() +
+  labs(title ="Average Cross-Platform Performance by Normalization Method",
+       x = "Error Level",
+       y = "AUC",
+       color = "Data Type") +
+  theme_minimal(base_size = 14)
+
+```
