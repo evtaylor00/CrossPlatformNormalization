@@ -1,0 +1,1 @@
+The 'ProposalCode_ETaylor' file contains all code related to synthetic data generation, modeling, and plotting for the project entitled "A Comparison of Normalization and Discretization in Cross-Platform Classification of Gene Expression Data"
