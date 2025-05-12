@@ -1,5 +1,5 @@
 ---
-title: "STAT 6358 Project Proposal Code"
+title: "STAT 6358 Project Code"
 author: "Ellen Taylor"
 format: html
 editor: visual
